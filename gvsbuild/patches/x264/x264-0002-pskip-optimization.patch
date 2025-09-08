@@ -1,0 +1,176 @@
+From ab17d8c51e5fde2395bbc4c9faf09fad514e2307 Mon Sep 17 00:00:00 2001
+From: Elias Carotti <eliascrt@amazon.it>
+Date: Mon, 8 Sep 2025 11:13:00 +0200
+Subject: [PATCH] pskip optimization
+
+---
+ common/base.c     |  3 +++
+ encoder/analyse.c | 16 ++++++++++++++
+ encoder/encoder.c | 53 ++++++++++++++++++++++++++++++++++++++++++++++-
+ x264.c            |  2 ++
+ x264.h            |  1 +
+ 5 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/common/base.c b/common/base.c
+index 34277277..abd1065d 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -1297,6 +1297,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
+         p->analyse.i_trellis = atoi(value);
+     OPT("fast-pskip")
+         p->analyse.b_fast_pskip = atobool(value);
++    OPT("mb-info-pskip-disable")
++        p->analyse.b_mb_info_pskip_disable = atobool(value);
+     OPT("dct-decimate")
+         p->analyse.b_dct_decimate = atobool(value);
+     OPT("deadzone-inter")
+@@ -1463,6 +1465,7 @@ char *x264_param2string( x264_param_t *p, int b_res )
+     s += sprintf( s, " cqm=%d", p->i_cqm_preset );
+     s += sprintf( s, " deadzone=%d,%d", p->analyse.i_luma_deadzone[0], p->analyse.i_luma_deadzone[1] );
+     s += sprintf( s, " fast_pskip=%d", p->analyse.b_fast_pskip );
++    s += sprintf( s, " mb_info_pskip_disable=%d", p->analyse.b_mb_info_pskip_disable );
+     s += sprintf( s, " chroma_qp_offset=%d", p->analyse.i_chroma_qp_offset );
+     s += sprintf( s, " threads=%d", p->i_threads );
+     s += sprintf( s, " lookahead_threads=%d", p->i_lookahead_threads );
+diff --git a/encoder/analyse.c b/encoder/analyse.c
+index adb63e1c..fa8fe8ef 100644
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -2928,6 +2928,22 @@ void x264_macroblock_analyse( x264_t *h )
+ 
+     if( h->param.analyse.b_mb_info )
+         h->fdec->effective_qp[h->mb.i_mb_xy] = h->mb.i_qp; /* Store the real analysis QP. */
++
++    /* P_SKIP bypass: Skip analysis entirely if mb_info indicates CONSTANT and bypass is enabled */
++    if( !h->param.analyse.b_mb_info_pskip_disable && h->fdec->mb_info && 
++        (h->fdec->mb_info[h->mb.i_mb_xy] & X264_MBINFO_CONSTANT) && 
++        h->sh.i_type != SLICE_TYPE_I )
++    {
++        h->mb.i_type = P_SKIP;
++        h->mb.i_partition = D_16x16;
++        h->mb.i_cbp_luma = 0;
++        h->mb.i_cbp_chroma = 0;
++        memset( h->mb.cache.non_zero_count, 0, sizeof( h->mb.cache.non_zero_count ) );
++        x264_macroblock_cache_ref( h, 0, 0, 4, 4, 0, 0 );
++        x264_macroblock_cache_mv_ptr( h, 0, 0, 4, 4, 0, h->mb.cache.pskip_mv );
++        return;
++    }
++
+     mb_analyse_init( h, &analysis, h->mb.i_qp );
+ 
+     /*--------------------------- Do the analysis ---------------------------*/
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index 20e620aa..64e85fc8 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1552,6 +1552,10 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
+     if( validate_parameters( h, 1 ) < 0 )
+         goto fail;
+ 
++    /* Log P_SKIP bypass status */
++    x264_log( h, X264_LOG_INFO, "P_SKIP bypass: %s\n", 
++              !h->param.analyse.b_mb_info_pskip_disable ? "enabled" : "disabled" );
++
+     if( h->param.psz_cqm_file )
+         if( x264_cqm_parse_file( h, h->param.psz_cqm_file ) < 0 )
+             goto fail;
+@@ -2852,6 +2856,52 @@ static intptr_t slice_write( x264_t *h )
+             h->mb.field[mb_xy] = MB_INTERLACED;
+         }
+ 
++        /* Early P_SKIP bypass: skip cache loading and analysis for known P_SKIP blocks */
++        if( !h->param.analyse.b_mb_info_pskip_disable && h->fdec->mb_info && 
++            (h->fdec->mb_info[h->mb.i_mb_xy] & X264_MBINFO_CONSTANT) && 
++            h->sh.i_type != SLICE_TYPE_I )
++        {
++            /* Batch consecutive P_SKIP blocks for maximum efficiency */
++            int skip_count = 0;
++            int mb_start = h->mb.i_mb_xy;
++            
++            /* Count consecutive P_SKIP blocks */
++            while( mb_start + skip_count < h->mb.i_mb_count && 
++                   (h->fdec->mb_info[mb_start + skip_count] & X264_MBINFO_CONSTANT) )
++                skip_count++;
++            
++            /* Process all consecutive P_SKIP blocks at once */
++            for( int skip_i = 0; skip_i < skip_count && h->mb.i_mb_xy < h->sh.i_last_mb; skip_i++ )
++            {
++                h->mb.i_type = P_SKIP;
++                h->mb.i_cbp_luma = 0;
++                h->mb.i_cbp_chroma = 0;
++                
++                if( h->param.b_cabac )
++                {
++                    if( h->mb.i_mb_xy > h->sh.i_first_mb && !(SLICE_MBAFF && (i_mb_y&1)) )
++                        x264_cabac_encode_terminal( &h->cabac );
++                    x264_cabac_mb_skip( h, 1 );
++                }
++                else
++                {
++                    i_skip++;
++                }
++                
++                if( skip_i < skip_count - 1 )
++                {
++                    h->mb.i_mb_xy++;
++                    i_mb_x++;
++                    if( i_mb_x == h->mb.i_mb_width )
++                    {
++                        i_mb_x = 0;
++                        i_mb_y++;
++                    }
++                }
++            }
++            goto next_mb;
++        }
++
+         /* load cache */
+         if( SLICE_MBAFF )
+             x264_macroblock_cache_load_interlaced( h, i_mb_x, i_mb_y );
+@@ -3053,9 +3103,10 @@ cont:
+         }
+ 
+         /* calculate deblock strength values (actual deblocking is done per-row along with hpel) */
+-        if( b_deblock )
++        if( b_deblock && !(!h->param.analyse.b_mb_info_pskip_disable && h->mb.i_type == P_SKIP) )
+             x264_macroblock_deblock_strength( h );
+ 
++next_mb:
+         if( mb_xy == h->sh.i_last_mb )
+             break;
+ 
+diff --git a/x264.c b/x264.c
+index 81583150..712a1e58 100644
+--- a/x264.c
++++ b/x264.c
+@@ -827,6 +827,7 @@ static void help( x264_param_t *defaults, int longhelp )
+         "                                  - 1: enabled only on the final encode of a MB\n"
+         "                                  - 2: enabled on all mode decisions\n", defaults->analyse.i_trellis );
+     H2( "      --no-fast-pskip         Disables early SKIP detection on P-frames\n" );
++    H2( "      --mb-info-pskip-disable  Disable P_SKIP bypass for mb_info blocks (bypass enabled by default)\n" );
+     H2( "      --no-dct-decimate       Disables coefficient thresholding on P-frames\n" );
+     H1( "      --nr <integer>          Noise reduction [%d]\n", defaults->analyse.i_noise_reduction );
+     H2( "\n" );
+@@ -1093,6 +1094,7 @@ static struct option long_options[] =
+     { "trellis",              required_argument, NULL, 't' },
+     { "fast-pskip",           no_argument,       NULL, 0 },
+     { "no-fast-pskip",        no_argument,       NULL, 0 },
++    { "mb-info-pskip-disable", no_argument,       NULL, 0 },
+     { "no-dct-decimate",      no_argument,       NULL, 0 },
+     { "aq-strength",          required_argument, NULL, 0 },
+     { "aq-mode",              required_argument, NULL, 0 },
+diff --git a/x264.h b/x264.h
+index cc22f05d..3c4ec117 100644
+--- a/x264.h
++++ b/x264.h
+@@ -428,6 +428,7 @@ typedef struct x264_param_t
+ 
+         int          b_mb_info;            /* Use input mb_info data in x264_picture_t */
+         int          b_mb_info_update; /* Update the values in mb_info according to the results of encoding. */
++        int          b_mb_info_pskip_disable; /* Disable analysis bypass for P_SKIP blocks indicated by mb_info */
+ 
+         /* the deadzone size that will be used in luma quantization */
+         int          i_luma_deadzone[2]; /* {inter, intra} */
+-- 
+2.43.0
+

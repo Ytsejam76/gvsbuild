@@ -32,6 +32,7 @@ class X264(GitRepo, Project):
             tag="31e19f92f00c7003fa115047ce50978bc98c3a0d",
             patches=[
                 "x264-0001-Prevent-mb_info_free-to-be-called-before-all-threads.patch",
+                "x264-0002-pskip-optimization.patch",
             ],
         )
 
